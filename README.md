@@ -22,7 +22,7 @@ FFmpeg and PDFium runtimes are downloaded automatically by the app on first use 
 
 ## License
 
-Copyright (c) 2026 EOS AI OS (smart-os@qq.com). Released under the [EOS Non-Commercial License v1.1](LICENSE) — free for personal and non-commercial use; commercial use requires a separate license from the copyright holder.
+Copyright (c) 2026 EOS AI OS (legal@eosaios.com). Released under the [EOS Non-Commercial License v1.1](LICENSE) — free for personal and non-commercial use; commercial use requires a separate license from the copyright holder.
 
 ## The EOS AI OS family
 
