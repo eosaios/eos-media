@@ -1,0 +1,191 @@
+name: Release
+
+# EOS Media 三端 Release 构建（Windows Inno / macOS dmg / Linux deb+AppImage）。
+# 源码在私有仓 eosaios/mediakit（经 EOS_SOURCE_PAT 检出），本公开仓只承载
+# 构建产物（Releases）——公开仓 Actions 不占免费额度，源码不出私有仓。
+# 版本号以 dispatch 输入 / tag 为准，构建前同步进 tauri.conf.json 与
+# workspace Cargo.toml（Inno 文件名、dmg 文件名、CLI --version 三处一致）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（如 v0.1.0-beta.2，留空则拒绝）"
+        required: true
+        default: ""
+      src_ref:
+        description: "源码 ref（默认 main）"
+        required: false
+        default: "main"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, platform: windows }
+          - { os: macos-latest, platform: macos }
+          - { os: ubuntu-latest, platform: linux }
+
+    steps:
+      - name: Checkout source (private)
+        uses: actions/checkout@v4
+        with:
+          repository: eosaios/mediakit
+          ref: ${{ inputs.src_ref || 'main' }}
+          token: ${{ secrets.EOS_SOURCE_PAT }}
+          path: src
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          v="${{ inputs.version || github.ref_name }}"
+          v="${v#v}"
+          [ -n "$v" ] || { echo "::error::版本号为空"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # 版本统一：tauri.conf.json（GUI About/dmg 与 deb 文件名）+ workspace
+      # Cargo.toml（CLI --version）。Cargo.toml 改动会由 cargo 构建时落到 lock。
+      - name: Sync version into manifests
+        shell: bash
+        working-directory: src
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          node -e '
+            const fs = require("fs");
+            const c = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8"));
+            c.version = process.argv[1];
+            fs.writeFileSync("src-tauri/tauri.conf.json", JSON.stringify(c, null, 2) + "\n");
+          ' "$V"
+          sed -i.bak -E 's/^(version = ").*(")$/\1'"$V"'\2/' Cargo.toml && rm Cargo.toml.bak
+          grep -n '^version' Cargo.toml
+
+      - name: Install Rust targets (universal, macOS)
+        if: matrix.platform == 'macos'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install Linux build deps
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libfuse2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+
+      # Windows 全链走 build.ps1：前端 → CLI → Tauri(NSIS) → Inno 安装器
+      # （含 WebView2Loader.dll 校验，缺失即抛错——beta.1 的教训）。
+      - name: Build (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        working-directory: src
+        run: ./build.ps1 -Version "${{ steps.ver.outputs.version }}"
+
+      - name: Build (macOS universal)
+        if: matrix.platform == 'macos'
+        working-directory: src
+        run: |
+          npm install --no-fund --no-audit
+          npx tauri build --target universal-apple-darwin --bundles dmg
+          cargo build --release -p eos-media-cli --target universal-apple-darwin
+
+      - name: Build (Linux)
+        if: matrix.platform == 'linux'
+        working-directory: src
+        run: |
+          npm install --no-fund --no-audit
+          npx tauri build --bundles deb,appimage
+          cargo build --release -p eos-media-cli
+
+      - name: Stage artifacts (Windows)
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ steps.ver.outputs.version }}"
+          mkdir -p dist
+          cp "src/output/eos-media-setup-$v.exe" dist/
+          cli="src/target/release/eos-media-cli.exe"
+          [ -f "$cli" ] || cli="src/src-tauri/target/release/eos-media-cli.exe"
+          cp "$cli" "dist/eos-media-cli-windows-x64.exe"
+          ls -la dist
+
+      - name: Stage artifacts (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          set -euo pipefail
+          v="${{ steps.ver.outputs.version }}"
+          mkdir -p dist
+          cp "src/src-tauri/target/universal-apple-darwin/release/bundle/dmg/EOS Media_${v}_universal.dmg" dist/
+          tar -czf dist/eos-media-cli-macos-universal.tar.gz \
+            -C src/src-tauri/target/universal-apple-darwin/release eos-media-cli
+          ls -la dist
+
+      - name: Stage artifacts (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp src/src-tauri/target/release/bundle/deb/*.deb dist/
+          cp src/src-tauri/target/release/bundle/appimage/*.AppImage dist/
+          tar -czf dist/eos-media-cli-linux-x64.tar.gz \
+            -C src/target/release eos-media-cli
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ inputs.version || github.ref_name }}"
+          gh release create "$VERSION" dist/* \
+            --title "EOS Media $VERSION" \
+            --notes "三端安装包（Windows Inno / macOS dmg / Linux deb+AppImage）+ 各平台 CLI。
+
+          - Windows：安装器已含 WebView2Loader.dll（beta.1 缺 DLL 秒退已修复），CLI 一并安装并可选加入 PATH
+          - macOS：未签名 dmg，首次打开如被 Gatekeeper 拦截请执行 \`xattr -cr \"/Applications/EOS Media.app\"\`
+          - FFmpeg / PDFium 运行时组件在应用内自动下载，安装包不内嵌
+          - 完整性校验见 SHA256SUMS.txt" \
+            --repo "$GITHUB_REPOSITORY" 2>/dev/null \
+          || gh release upload "$VERSION" dist/* --clobber --repo "$GITHUB_REPOSITORY"
