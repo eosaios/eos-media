@@ -106,7 +106,13 @@ jobs:
         run: |
           npm install --no-fund --no-audit
           npx tauri build --target universal-apple-darwin --bundles dmg
-          cargo build --release -p eos-media-cli --target universal-apple-darwin
+          # universal-apple-darwin 是 Tauri CLI 合成的目标，原生 cargo 不认识：
+          # CLI 分别构建双架构再 lipo 合一
+          cargo build --release -p eos-media-cli --target aarch64-apple-darwin
+          cargo build --release -p eos-media-cli --target x86_64-apple-darwin
+          lipo -create -output target/eos-media-cli-universal \
+            target/aarch64-apple-darwin/release/eos-media-cli \
+            target/x86_64-apple-darwin/release/eos-media-cli
 
       - name: Build (Linux)
         if: matrix.platform == 'linux'
@@ -135,9 +141,10 @@ jobs:
           set -euo pipefail
           v="${{ steps.ver.outputs.version }}"
           mkdir -p dist
-          cp "src/src-tauri/target/universal-apple-darwin/release/bundle/dmg/EOS Media_${v}_universal.dmg" dist/
+          # Tauri/Cargo 产物都在工作区根 target/（cargo workspace 目标目录）
+          cp "src/target/universal-apple-darwin/release/bundle/dmg/EOS Media_${v}_universal.dmg" dist/
           tar -czf dist/eos-media-cli-macos-universal.tar.gz \
-            -C src/src-tauri/target/universal-apple-darwin/release eos-media-cli
+            -C src/target eos-media-cli-universal
           ls -la dist
 
       - name: Stage artifacts (Linux)
@@ -145,8 +152,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp src/src-tauri/target/release/bundle/deb/*.deb dist/
-          cp src/src-tauri/target/release/bundle/appimage/*.AppImage dist/
+          cp src/target/release/bundle/deb/*.deb dist/
+          cp src/target/release/bundle/appimage/*.AppImage dist/
           tar -czf dist/eos-media-cli-linux-x64.tar.gz \
             -C src/target/release eos-media-cli
           ls -la dist
