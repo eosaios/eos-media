@@ -12,7 +12,9 @@
 
 ## Download
 
-Grab the latest installer from [Releases](../../releases). Windows comes first; macOS and Linux builds are on the way.
+Choose an installer from [Releases](../../releases) and check its channel and platform. **Dev** is for development, **Beta** is for testing, and a version without a prerelease suffix is stable. Dev and Beta use separate application names and data directories in newly built releases. Historical beta.1–beta.3 packages used the plain EOS Media identity.
+
+New releases include per-platform manifests (version, channel, source commit) and SHA256SUMS.txt. Existing published assets are never replaced. Dev/Beta releases are marked as prereleases and do not become stable Latest.
 
 FFmpeg and PDFium runtimes are downloaded automatically by the app on first use — or you can use your own system installation.
 

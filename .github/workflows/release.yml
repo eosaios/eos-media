@@ -1,33 +1,82 @@
 name: Release
 
-# EOS Media 三端 Release 构建（Windows Inno / macOS dmg / Linux deb+AppImage）。
-# 源码在私有仓 eosaios/mediakit（经 EOS_SOURCE_PAT 检出），本公开仓只承载
-# 构建产物（Releases）——公开仓 Actions 不占免费额度，源码不出私有仓。
-# 版本号以 dispatch 输入 / tag 为准，构建前同步进 tauri.conf.json 与
-# workspace Cargo.toml（Inno 文件名、dmg 文件名、CLI --version 三处一致）。
-
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（如 v0.1.0-beta.2，留空则拒绝）"
+        description: "Explicit version, e.g. 0.1.0-dev.1 or 0.1.0-beta.4"
         required: true
-        default: ""
+      channel:
+        description: "Must match the version suffix"
+        type: choice
+        options: [dev, beta, stable]
+        default: dev
+        required: true
+      publish:
+        description: "Publish a new release after validation (false builds Actions artifacts only)"
+        type: boolean
+        default: false
+        required: true
       src_ref:
-        description: "源码 ref（默认 main）"
-        required: false
-        default: "main"
+        description: "Reviewed source ref (resolved to one commit before building)"
+        default: main
+        required: true
   push:
     tags: ["v*"]
 
 permissions:
   contents: write
 
+concurrency:
+  group: media-release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+      source_commit: ${{ steps.meta.outputs.source_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: eosaios/mediakit
+          ref: ${{ inputs.src_ref || 'main' }}
+          token: ${{ secrets.EOS_SOURCE_PAT }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Validate channel/version and pin source
+        id: meta
+        working-directory: src
+        env:
+          REQUEST_VERSION: ${{ inputs.version || github.ref_name }}
+          REQUEST_CHANNEL: ${{ inputs.channel }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Only pass user inputs as data, never interpolate them into shell source.
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import { identity } from './scripts/release.mjs';
+          const info = identity(process.env.REQUEST_VERSION.replace(/^v/, ''), process.env.REQUEST_CHANNEL || undefined);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${info.version}\nchannel=${info.channel}\n`);
+          JS
+          echo "source_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          tag="v${REQUEST_VERSION#v}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release already exists: $tag. Choose a new version; existing assets are immutable."
+            exit 1
+          fi
+
   build:
+    needs: resolve
     name: build (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -37,127 +86,106 @@ jobs:
           - { os: windows-latest, platform: windows }
           - { os: macos-latest, platform: macos }
           - { os: ubuntu-latest, platform: linux }
-
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      CHANNEL: ${{ needs.resolve.outputs.channel }}
+      SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src/target/channels/${{ needs.resolve.outputs.channel }}
     steps:
-      - name: Checkout source (private)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: eosaios/mediakit
-          ref: ${{ inputs.src_ref || 'main' }}
+          ref: ${{ needs.resolve.outputs.source_commit }}
           token: ${{ secrets.EOS_SOURCE_PAT }}
           path: src
-
+          persist-credentials: false
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
-
-      - name: Resolve version
-        id: ver
-        shell: bash
-        run: |
-          v="${{ inputs.version || github.ref_name }}"
-          v="${v#v}"
-          [ -n "$v" ] || { echo "::error::版本号为空"; exit 1; }
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-
-      # 版本统一：tauri.conf.json（GUI About/dmg 与 deb 文件名）+ workspace
-      # Cargo.toml（CLI --version）。Cargo.toml 改动会由 cargo 构建时落到 lock。
-      - name: Sync version into manifests
+      - name: Prepare coherent release metadata
         shell: bash
         working-directory: src
         run: |
-          V="${{ steps.ver.outputs.version }}"
-          node -e '
-            const fs = require("fs");
-            const c = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8"));
-            c.version = process.argv[1];
-            fs.writeFileSync("src-tauri/tauri.conf.json", JSON.stringify(c, null, 2) + "\n");
-          ' "$V"
-          sed -i.bak -E 's/^(version = ").*(")$/\1'"$V"'\2/' Cargo.toml && rm Cargo.toml.bak
-          grep -n '^version' Cargo.toml
-
-      - name: Install Rust targets (universal, macOS)
+          set -euo pipefail
+          node scripts/release.mjs prepare --version "$VERSION" --channel "$CHANNEL"
+          node --test scripts/release.test.mjs
+      - name: Install Rust targets
         if: matrix.platform == 'macos'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
-      - name: Install Linux build deps
+      - name: Install Linux dependencies
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libfuse2
-
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libfuse2
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src
-
-      # Windows 全链走 build.ps1：前端 → CLI → Tauri(NSIS) → Inno 安装器
-      # （含 WebView2Loader.dll 校验，缺失即抛错——beta.1 的教训）。
-      - name: Build (Windows)
+          workspaces: src -> target/channels/${{ needs.resolve.outputs.channel }}
+      - name: Build Windows installers and CLI
         if: matrix.platform == 'windows'
         shell: pwsh
         working-directory: src
-        run: ./build.ps1 -Version "${{ steps.ver.outputs.version }}"
-
-      - name: Build (macOS universal)
+        run: ./build.ps1 -Version $env:VERSION -Channel $env:CHANNEL
+      - name: Build macOS universal
         if: matrix.platform == 'macos'
         working-directory: src
         run: |
-          npm install --no-fund --no-audit
-          npx tauri build --target universal-apple-darwin --bundles dmg
-          # universal-apple-darwin 是 Tauri CLI 合成的目标，原生 cargo 不认识：
-          # CLI 分别构建双架构再 lipo 合一
-          cargo build --release -p eos-media-cli --target aarch64-apple-darwin
-          cargo build --release -p eos-media-cli --target x86_64-apple-darwin
-          lipo -create -output target/eos-media-cli-universal \
-            target/aarch64-apple-darwin/release/eos-media-cli \
-            target/x86_64-apple-darwin/release/eos-media-cli
-
-      - name: Build (Linux)
+          set -euo pipefail
+          npm ci --no-fund --no-audit
+          npm run typecheck
+          npm run tauri -- build --target universal-apple-darwin --bundles dmg
+          cargo build --locked --release -p eos-media-cli --target aarch64-apple-darwin
+          cargo build --locked --release -p eos-media-cli --target x86_64-apple-darwin
+          lipo -create -output "$CARGO_TARGET_DIR/eos-media-cli-universal" \
+            "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/eos-media-cli" \
+            "$CARGO_TARGET_DIR/x86_64-apple-darwin/release/eos-media-cli"
+          test "$("$CARGO_TARGET_DIR/eos-media-cli-universal" --version)" = "EOS Media v$VERSION"
+      - name: Build Linux
         if: matrix.platform == 'linux'
         working-directory: src
         run: |
-          npm install --no-fund --no-audit
-          npx tauri build --bundles deb,appimage
-          cargo build --release -p eos-media-cli
-
-      - name: Stage artifacts (Windows)
+          set -euo pipefail
+          npm ci --no-fund --no-audit
+          npm run typecheck
+          npm run tauri -- build --bundles deb,appimage
+          cargo build --locked --release -p eos-media-cli
+          test "$("$CARGO_TARGET_DIR/release/eos-media-cli" --version)" = "EOS Media v$VERSION"
+      - name: Stage Windows
         if: matrix.platform == 'windows'
         shell: bash
         run: |
           set -euo pipefail
-          v="${{ steps.ver.outputs.version }}"
           mkdir -p dist
-          cp "src/output/eos-media-setup-$v.exe" dist/
-          cli="src/target/release/eos-media-cli.exe"
-          [ -f "$cli" ] || cli="src/src-tauri/target/release/eos-media-cli.exe"
-          cp "$cli" "dist/eos-media-cli-windows-x64.exe"
-          ls -la dist
-
-      - name: Stage artifacts (macOS)
+          cp "src/output/$CHANNEL/$VERSION/eos-media-setup-$VERSION.exe" dist/
+          cp "src/target/channels/$CHANNEL/release/eos-media-cli.exe" "dist/eos-media-cli-$VERSION-windows-x64.exe"
+      - name: Stage macOS
         if: matrix.platform == 'macos'
         run: |
           set -euo pipefail
-          v="${{ steps.ver.outputs.version }}"
           mkdir -p dist
-          # Tauri/Cargo 产物都在工作区根 target/（cargo workspace 目标目录）
-          cp "src/target/universal-apple-darwin/release/bundle/dmg/EOS Media_${v}_universal.dmg" dist/
-          tar -czf dist/eos-media-cli-macos-universal.tar.gz \
-            -C src/target eos-media-cli-universal
-          ls -la dist
-
-      - name: Stage artifacts (Linux)
+          cp "$CARGO_TARGET_DIR/universal-apple-darwin/release/bundle/dmg/"*"_${VERSION}_universal.dmg" dist/
+          tar -czf "dist/eos-media-cli-$VERSION-macos-universal.tar.gz" -C "$CARGO_TARGET_DIR" eos-media-cli-universal
+      - name: Stage Linux
         if: matrix.platform == 'linux'
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp src/target/release/bundle/deb/*.deb dist/
-          cp src/target/release/bundle/appimage/*.AppImage dist/
-          tar -czf dist/eos-media-cli-linux-x64.tar.gz \
-            -C src/target/release eos-media-cli
-          ls -la dist
-
+          cp "$CARGO_TARGET_DIR/release/bundle/deb/"*.deb dist/
+          cp "$CARGO_TARGET_DIR/release/bundle/appimage/"*.AppImage dist/
+          tar -czf "dist/eos-media-cli-$VERSION-linux-x64.tar.gz" -C "$CARGO_TARGET_DIR/release" eos-media-cli
+      - name: Record build identity
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          cd src
+          node scripts/release.mjs check
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import { check } from './scripts/release.mjs';
+          const info = { ...check(process.cwd()), sourceCommit: process.env.SOURCE_COMMIT, platform: process.env.PLATFORM };
+          fs.writeFileSync(`../dist/release-manifest-${info.platform}.json`, JSON.stringify(info, null, 2) + '\n');
+          JS
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.platform }}
@@ -165,34 +193,21 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Create GitHub Release
+    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
-    needs: build
+    needs: [resolve, build]
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: dist-*
           merge-multiple: true
-
-      - name: Generate SHA256SUMS
-        run: |
-          cd dist
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
-      - name: Create release
+      - name: Generate checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - name: Publish once with correct channel classification
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ inputs.version || github.ref_name }}"
-          gh release create "$VERSION" dist/* \
-            --title "EOS Media $VERSION" \
-            --notes "三端安装包（Windows Inno / macOS dmg / Linux deb+AppImage）+ 各平台 CLI。
-
-          - Windows：安装器已含 WebView2Loader.dll（beta.1 缺 DLL 秒退已修复），CLI 一并安装并可选加入 PATH
-          - macOS：未签名 dmg，首次打开如被 Gatekeeper 拦截请执行 \`xattr -cr \"/Applications/EOS Media.app\"\`
-          - FFmpeg / PDFium 运行时组件在应用内自动下载，安装包不内嵌
-          - 完整性校验见 SHA256SUMS.txt" \
-            --repo "$GITHUB_REPOSITORY" 2>/dev/null \
-          || gh release upload "$VERSION" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+        run: bash scripts/publish.sh
