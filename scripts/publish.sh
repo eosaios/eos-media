@@ -22,4 +22,4 @@ assets=(dist/*)
 ((${#assets[@]} > 0)) || { echo 'No release artifacts' >&2; exit 1; }
 gh release create "v$VERSION" "${assets[@]}" "${classification[@]}" \
   --repo "$GITHUB_REPOSITORY" --title "EOS Media $VERSION ($CHANNEL)" \
-  --notes 'Native installers and CLI. Version, channel and source commit are recorded in the per-platform release manifests. Check SHA256SUMS.txt before installing. macOS builds are unsigned. Dev, Beta and stable use separate application identities and data directories.'
+  --notes 'Native installers and CLI. Version, channel and source commit are recorded in the per-platform release manifests. Check SHA256SUMS.txt before installing. macOS builds use ad-hoc signatures with hardened runtime and are not Developer ID notarized. Dev, Beta and stable use separate application identities and data directories.'
