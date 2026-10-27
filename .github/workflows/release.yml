@@ -17,6 +17,12 @@ on:
         type: boolean
         default: false
         required: true
+      platforms:
+        description: "Build macOS only or all platforms"
+        type: choice
+        options: [macos, all]
+        default: all
+        required: true
       src_ref:
         description: "Reviewed source ref (resolved to one commit before building)"
         default: main
@@ -41,6 +47,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       channel: ${{ steps.meta.outputs.channel }}
       source_commit: ${{ steps.meta.outputs.source_commit }}
+      matrix: ${{ steps.meta.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,6 +65,7 @@ jobs:
         env:
           REQUEST_VERSION: ${{ inputs.version || github.ref_name }}
           REQUEST_CHANNEL: ${{ inputs.channel }}
+          REQUEST_PLATFORMS: ${{ inputs.platforms || 'all' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -66,6 +74,9 @@ jobs:
           import fs from 'node:fs';
           import { identity } from './scripts/release.mjs';
           const info = identity(process.env.REQUEST_VERSION.replace(/^v/, ''), process.env.REQUEST_CHANNEL || undefined);
+          const platforms = [{ os: 'windows-latest', platform: 'windows' }, { os: 'macos-latest', platform: 'macos' }, { os: 'ubuntu-latest', platform: 'linux' }];
+          const selected = process.env.REQUEST_PLATFORMS === 'macos' ? platforms.filter(p => p.platform === 'macos') : platforms;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({include:selected})}\n`);
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${info.version}\nchannel=${info.channel}\n`);
           JS
           echo "source_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -81,11 +92,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { os: windows-latest, platform: windows }
-          - { os: macos-latest, platform: macos }
-          - { os: ubuntu-latest, platform: linux }
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
       CHANNEL: ${{ needs.resolve.outputs.channel }}
@@ -109,6 +116,24 @@ jobs:
           set -euo pipefail
           node scripts/release.mjs prepare --version "$VERSION" --channel "$CHANNEL"
           node --test scripts/release.test.mjs
+      - name: Resolve pinned shared core
+        id: core
+        shell: bash
+        working-directory: src
+        run: |
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          const core = JSON.parse(fs.readFileSync('release-core.json'));
+          if (core.repository !== 'eosaios/eos-core-rs' || !/^[a-f0-9]{40}$/.test(core.commit)) throw new Error('Invalid shared core pin');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `commit=${core.commit}\n`);
+          JS
+      - uses: actions/checkout@v4
+        with:
+          repository: eosaios/eos-core-rs
+          ref: ${{ steps.core.outputs.commit }}
+          token: ${{ secrets.EOS_SOURCE_PAT }}
+          path: eos-core-rs
+          persist-credentials: false
       - name: Install Rust targets
         if: matrix.platform == 'macos'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -132,7 +157,21 @@ jobs:
           set -euo pipefail
           npm ci --no-fund --no-audit
           npm run typecheck
-          npm run tauri -- build --target universal-apple-darwin --bundles dmg
+          npm run test:release
+          npm test
+          xcodebuild -version
+          npm run tauri -- build --target universal-apple-darwin --bundles app
+          APP_NAME="$(node -p 'require("./src-tauri/tauri.conf.json").productName')"
+          APP="$CARGO_TARGET_DIR/universal-apple-darwin/release/bundle/macos/$APP_NAME.app"
+          test -s "$APP/Contents/Resources/Assets.car"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$APP/Contents/Info.plist")" = Media
+          codesign --force --sign - --options runtime "$APP"
+          codesign --verify --deep --strict "$APP"
+          mkdir -p "$CARGO_TARGET_DIR/dmg-stage"
+          ditto "$APP" "$CARGO_TARGET_DIR/dmg-stage/$APP_NAME.app"
+          ln -s /Applications "$CARGO_TARGET_DIR/dmg-stage/Applications"
+          hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$CARGO_TARGET_DIR/dmg-stage" -format UDZO "$CARGO_TARGET_DIR/$APP_NAME"_"$VERSION"_universal.dmg
+          hdiutil verify "$CARGO_TARGET_DIR/$APP_NAME"_"$VERSION"_universal.dmg
           cargo build --locked --release -p eos-media-cli --target aarch64-apple-darwin
           cargo build --locked --release -p eos-media-cli --target x86_64-apple-darwin
           lipo -create -output "$CARGO_TARGET_DIR/eos-media-cli-universal" \
@@ -162,7 +201,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "$CARGO_TARGET_DIR/universal-apple-darwin/release/bundle/dmg/"*"_${VERSION}_universal.dmg" dist/
+          # GitHub normalizes spaces to dots in uploaded asset names. Do it
+          # before generating checksums so download names match the manifest.
+          for image in "$CARGO_TARGET_DIR/"*"_${VERSION}_universal.dmg"; do
+            asset_name="$(basename "$image")"
+            cp "$image" "dist/${asset_name// /.}"
+          done
+          cp src/src-tauri/icons/native/manifest.json dist/native-icon-manifest-macos.json
           tar -czf "dist/eos-media-cli-$VERSION-macos-universal.tar.gz" -C "$CARGO_TARGET_DIR" eos-media-cli-universal
       - name: Stage Linux
         if: matrix.platform == 'linux'
@@ -183,7 +228,7 @@ jobs:
           node --input-type=module <<'JS'
           import fs from 'node:fs';
           import { check } from './scripts/release.mjs';
-          const info = { ...check(process.cwd()), sourceCommit: process.env.SOURCE_COMMIT, platform: process.env.PLATFORM };
+          const info = { ...check(process.cwd()), sourceCommit: process.env.SOURCE_COMMIT, sharedCore: JSON.parse(fs.readFileSync('release-core.json')), platform: process.env.PLATFORM };
           fs.writeFileSync(`../dist/release-manifest-${info.platform}.json`, JSON.stringify(info, null, 2) + '\n');
           JS
       - uses: actions/upload-artifact@v4
