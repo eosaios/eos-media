@@ -201,7 +201,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "$CARGO_TARGET_DIR/"*"_${VERSION}_universal.dmg" dist/
+          # GitHub normalizes spaces to dots in uploaded asset names. Do it
+          # before generating checksums so download names match the manifest.
+          for image in "$CARGO_TARGET_DIR/"*"_${VERSION}_universal.dmg"; do
+            asset_name="$(basename "$image")"
+            cp "$image" "dist/${asset_name// /.}"
+          done
           cp src/src-tauri/icons/native/manifest.json dist/native-icon-manifest-macos.json
           tar -czf "dist/eos-media-cli-$VERSION-macos-universal.tar.gz" -C "$CARGO_TARGET_DIR" eos-media-cli-universal
       - name: Stage Linux
