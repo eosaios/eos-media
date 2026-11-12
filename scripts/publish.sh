@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 : "${VERSION:?}" "${CHANNEL:?}" "${GITHUB_REPOSITORY:?}"
+# Independent public-repository fence: an older source ref cannot authorize stable.
+# Read policy relative to this script, not the caller's working directory.
+POLICY_FILE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/release-policy.json"
+node - "$POLICY_FILE" "$CHANNEL" <<'JS'
+const fs = require('node:fs');
+const { maximumChannel } = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const ranks = { dev: 0, beta: 1, stable: 2 };
+if (!Object.hasOwn(ranks, maximumChannel) || !Object.hasOwn(ranks, process.argv[3]) || ranks[process.argv[3]] > ranks[maximumChannel]) {
+  console.error(`Release channel ${process.argv[3]} is blocked by release policy (${maximumChannel})`);
+  process.exit(1);
+}
+JS
 # This script runs in the public release repo; source code is never uploaded.
 case "$CHANNEL" in
   dev|beta)

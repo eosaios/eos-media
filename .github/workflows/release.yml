@@ -9,7 +9,7 @@ on:
       channel:
         description: "Must match the version suffix"
         type: choice
-        options: [dev, beta, stable]
+        options: [dev, beta]
         default: dev
         required: true
       publish:
@@ -72,8 +72,8 @@ jobs:
           # Only pass user inputs as data, never interpolate them into shell source.
           node --input-type=module <<'JS'
           import fs from 'node:fs';
-          import { identity } from './scripts/release.mjs';
-          const info = identity(process.env.REQUEST_VERSION.replace(/^v/, ''), process.env.REQUEST_CHANNEL || undefined);
+          import { identity, checkReleasePolicy } from './scripts/release.mjs';
+          const info = checkReleasePolicy(process.cwd(), identity(process.env.REQUEST_VERSION.replace(/^v/, ''), process.env.REQUEST_CHANNEL || undefined));
           const platforms = [{ os: 'windows-latest', platform: 'windows' }, { os: 'macos-latest', platform: 'macos' }, { os: 'ubuntu-latest', platform: 'linux' }];
           const selected = process.env.REQUEST_PLATFORMS === 'macos' ? platforms.filter(p => p.platform === 'macos') : platforms;
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({include:selected})}\n`);
